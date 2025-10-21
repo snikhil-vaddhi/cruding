@@ -24,6 +24,7 @@ use sea_orm::{
     entity::prelude::*,
     sea_query::{IntoCondition, PostgresQueryBuilder},
 };
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use serial_test::serial;
 use uuid::Uuid;
@@ -37,7 +38,7 @@ fn db_url() -> String {
 
 // ---------- test entity (Postgres) ----------
 
-#[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
+#[derive(Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "items_filter")]
 pub struct Model {
     #[sea_orm(primary_key)]
