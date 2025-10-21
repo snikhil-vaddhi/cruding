@@ -12,8 +12,8 @@ use std::{hash::Hash, sync::Arc};
 use crate::hook::CrudableHook;
 
 pub trait Crudable: Clone + Send + Sync + 'static {
-    type Pkey: Clone + Eq + Hash + Send + Sync + 'static;
-    type MonoField: PartialOrd + Send + Sync + 'static;
+    type Pkey: Clone + Eq + Hash + Send + Sync + serde::Serialize + 'static;
+    type MonoField: PartialOrd + Send + Sync + serde::Serialize + 'static;
 
     fn pkey(&self) -> Self::Pkey;
     fn mono_field(&self) -> Self::MonoField;

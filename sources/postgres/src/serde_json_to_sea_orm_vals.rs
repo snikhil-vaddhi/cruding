@@ -1,10 +1,12 @@
 use base64::{Engine, prelude::BASE64_STANDARD};
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
+use cruding_core::Crudable;
 use rust_decimal::Decimal;
 use sea_orm::{
-    ColumnTrait, DbErr,
+    ColumnTrait, DbErr, EntityName, EntityTrait, ModelTrait,
     sea_query::{ArrayType, ColumnType},
 };
+use serde_json::json;
 use uuid::Uuid;
 
 type SValue = sea_orm::Value;
@@ -244,6 +246,26 @@ fn as_f64(v: serde_json::Value) -> Result<f64, DbErr> {
         serde_json::Value::Null => Err(DbErr::Custom("null not allowed here".into())),
         _ => Err(DbErr::Custom(format!("Expected number, got {v}"))),
     }
+}
+
+pub fn pk_json_from_model<M>(m: &M) -> serde_json::Value
+where
+    M: Crudable,
+    M::Pkey: serde::Serialize,
+{
+    serde_json::json!({ "id": m.pkey() })
+}
+
+pub fn meta_from_model<T>(_m: &T) -> serde_json::Value
+where
+    T: ModelTrait,
+    T::Entity: EntityTrait + EntityName + Default,
+{
+    let entity = <T::Entity as Default>::default();
+    let table = entity.table_name().to_owned();
+    json!({
+        "table": table,
+    })
 }
 
 #[cfg(test)]

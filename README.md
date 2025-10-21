@@ -7,7 +7,7 @@
     - specialized handlers (have specialized handlers that work in parallel to CRUD handlers)
 - [ ] implement automatic outbox table that registers events on commit using postgres constructs, example:
 ```pgsql
-CREATE TABLE event_outbox (
+CREATE TABLE outbox (
   id           bigserial PRIMARY KEY,
   topic        text NOT NULL,           -- e.g., "customer:123"
   event_type   text NOT NULL,           -- e.g., "order.created"
@@ -17,12 +17,12 @@ CREATE TABLE event_outbox (
   published_at timestamptz
 );
 
-CREATE INDEX ON event_outbox (published_at) WHERE published_at IS NULL;
+CREATE INDEX ON outbox (published_at) WHERE published_at IS NULL;
 
 CREATE OR REPLACE FUNCTION orders_after_ins_outbox()
 RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
-  INSERT INTO event_outbox (topic, event_type, entity_id, payload)
+  INSERT INTO outbox (topic, event_type, entity_id, payload)
   SELECT format('customer:%s', o.customer_id),
          'order.created',
          o.id::text,

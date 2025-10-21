@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["apis/axum", "core", "cruding", "common/cruding_qs_list_filter", "sources/postgres", "examples/todo", "macros", "macros/macro_tests/*", "caches/in_memory", "caches/redis"]
+members = ["apis/axum", "core", "cruding", "common/cruding_qs_list_filter", "sources/postgres", "examples/todo", "macros", "macros/macro_tests/*", "caches/in_memory", "caches/redis", "migration",]
 
 [workspace.package]
 license = "MIT"

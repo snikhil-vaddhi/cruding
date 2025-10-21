@@ -1,23 +1,30 @@
+pub mod outbox;
 pub mod serde_json_to_sea_orm_vals;
 
 use std::{
+    collections::HashMap,
     marker::PhantomData,
     sync::{Arc, atomic::AtomicBool},
 };
 
 use async_trait::async_trait;
+use chrono::Utc;
 use cruding_core::{
     Crudable, CrudableSource, UpdateComparingParams,
     list::{CrudableSourceListExt, CrudingListParams, CrudingListSortOrder},
 };
+use outbox::{CrudOpType, Outbox};
 use sea_orm::{
     DatabaseConnection, DatabaseTransaction, DbErr, EntityTrait, FromQueryResult, IntoActiveModel,
     Iterable, ModelTrait, QueryOrder, QuerySelect, SelectColumns, Statement, TransactionTrait,
     TryGetableMany, prelude::*, sea_query::IntoCondition,
 };
+use serde_json::json;
 use tokio::sync::RwLock;
 
-use crate::serde_json_to_sea_orm_vals::{json_to_value_for_column, json_to_value_for_column_arr};
+use crate::serde_json_to_sea_orm_vals::{
+    json_to_value_for_column, json_to_value_for_column_arr, meta_from_model, pk_json_from_model,
+};
 
 pub trait PostgresCrudableTable: EntityTrait
 where
@@ -114,24 +121,34 @@ impl PostgresCrudableConnectionInner {
         Ok(())
     }
 
-    /// Will commit if connection is owned transaction
     pub async fn maybe_commit(&mut self) -> Result<(), DbErr> {
-        let mut conn = None;
-
-        if let Self::OwnedTransaction(c, _) = self {
-            conn = Some(c.clone());
+        let saved_conn = if let Self::OwnedTransaction(ref c, _) = *self {
+            c.clone()
+        } else {
+            return Ok(());
         };
 
-        if let Some(conn) = conn {
-            let Self::OwnedTransaction(_, tx) = std::mem::replace(self, Self::Connection(conn))
-            else {
-                unreachable!()
-            };
-            Arc::try_unwrap(tx).map_err(|_| DbErr::Custom("Failed to finish an OwnedTransaction this means something still holds a reference to it...".to_string()))?.
-            commit().await?;
-        }
+        let taken = std::mem::replace(self, Self::Connection(saved_conn.clone()));
+        let (_owned_conn, tx_arc) = match taken {
+            Self::OwnedTransaction(c, tx_arc) => (c, tx_arc),
+            other => {
+                *self = other;
+                return Ok(());
+            }
+        };
 
-        Ok(())
+        match Arc::try_unwrap(tx_arc) {
+            Ok(tx) => {
+                tx.commit().await?;
+                Ok(())
+            }
+            Err(still_shared) => {
+                *self = Self::OwnedTransaction(saved_conn, still_shared);
+                Err(DbErr::Custom(
+                    "Cannot commit transaction — still shared".to_string(),
+                ))
+            }
+        }
     }
 
     pub async fn get_conn(&self) -> &(dyn ConnectionTrait + Send + Sync) {
@@ -139,6 +156,14 @@ impl PostgresCrudableConnectionInner {
             Self::Connection(c) => c,
             Self::OwnedTransaction(_, tx) => tx.as_ref(),
             Self::BorrowedTransaction(tx) => tx.as_ref(),
+        }
+    }
+
+    pub fn tx_arc(&self) -> Option<Arc<DatabaseTransaction>> {
+        match self {
+            Self::OwnedTransaction(_, tx) => Some(tx.clone()),
+            Self::BorrowedTransaction(tx) => Some(tx.clone()),
+            _ => None,
         }
     }
 }
@@ -184,7 +209,8 @@ where
     CRUDTable::Model: Crudable
         + ModelTrait<Entity = CRUDTable>
         + IntoActiveModel<<CRUDTable as EntityTrait>::ActiveModel>
-        + FromQueryResult,
+        + FromQueryResult
+        + serde::Serialize,
     CRUDTable::Column: Iterable + PartialEq,
     CRUDTable::ActiveModel: Send,
     Error: From<sea_orm::DbErr> + Send + Sync + 'static,
@@ -199,6 +225,11 @@ where
         items: Vec<<CRUDTable as EntityTrait>::Model>,
         handle: Self::SourceHandle,
     ) -> Result<Vec<<CRUDTable as EntityTrait>::Model>, Self::Error> {
+        {
+            let mut inner = handle.conn.write().await;
+            inner.maybe_begin_transaction().await?;
+        }
+
         let active_models: Vec<<CRUDTable as EntityTrait>::ActiveModel> = items
             .into_iter()
             .map(IntoActiveModel::into_active_model)
@@ -215,6 +246,41 @@ where
                 q.exec_with_returning_many(tx.as_ref()).await
             }
         }?;
+
+        let table_name = CRUDTable::default().table_name().to_string();
+
+        let tx_arc = {
+            let inner = handle.conn.read().await;
+            inner
+                .tx_arc()
+                .expect("create(): expected to be in a transaction")
+        };
+
+        for item in &returned_items {
+            let pk_json = pk_json_from_model(item);
+            let meta = meta_from_model(item);
+            let mono = serde_json::to_value(item.mono_field()).unwrap_or_else(|_| json!(null));
+
+            Outbox::insert(
+                tx_arc.as_ref(),
+                &table_name,
+                pk_json,
+                CrudOpType::C,
+                meta,
+                json!({}),
+                mono,
+                Utc::now(),
+            )
+            .await
+            .map_err(|e| sea_orm::DbErr::Custom(format!("outbox insert failed: {e}")))?;
+        }
+
+        drop(tx_arc);
+
+        {
+            let mut inner = handle.conn.write().await;
+            inner.maybe_commit().await?;
+        }
 
         Ok(returned_items)
     }
@@ -247,9 +313,15 @@ where
             return Ok(Vec::new());
         }
 
+        {
+            let mut inner = handle.conn.write().await;
+            inner.maybe_begin_transaction().await?;
+        }
+
         // 1) Resolve table & columns from the entity
         let table = CRUDTable::default();
         let table_name = format!(r#""{}""#, table.table_name());
+        let table_name_for_outbox = table.table_name().to_string();
         let pk_cols: Vec<<CRUDTable as EntityTrait>::Column> =
             <CRUDTable as PostgresCrudableTable>::get_pkey_columns();
         let all_cols: Vec<<CRUDTable as EntityTrait>::Column> =
@@ -329,10 +401,10 @@ where
         // 3) Final SQL with only identifiers interpolated, all values bound
         let sql = format!(
             "UPDATE {table} AS t \
-         SET {set_clause} \
-         FROM (VALUES {values_rows}) AS v {vcols} \
-         WHERE {where_clause} \
-         RETURNING t.*;",
+            SET {set_clause} \
+            FROM (VALUES {values_rows}) AS v {vcols} \
+            WHERE {where_clause} \
+            RETURNING t.*;",
             table = table_name,
             set_clause = set_sql,
             values_rows = rows_sql.join(", "),
@@ -357,7 +429,7 @@ where
             Ok(out)
         }
 
-        let returned = match &*handle.conn.read().await {
+        let returned: Vec<<CRUDTable as EntityTrait>::Model> = match &*handle.conn.read().await {
             PostgresCrudableConnectionInner::Connection(c) => run(c, stmt).await?,
             PostgresCrudableConnectionInner::OwnedTransaction(_, tx) => {
                 run(tx.as_ref(), stmt).await?
@@ -366,6 +438,87 @@ where
                 run(tx.as_ref(), stmt).await?
             }
         };
+
+        let mut old_by_pk: HashMap<<CRUDTable::Model as Crudable>::Pkey, &CRUDTable::Model> =
+            HashMap::with_capacity(items.current.len());
+        for arc_m in &items.current {
+            old_by_pk.insert(arc_m.pkey(), arc_m.as_ref());
+        }
+
+        let tx_arc = {
+            let inner = handle.conn.read().await;
+            inner
+                .tx_arc()
+                .expect("update(): expected to be in a transaction")
+        };
+
+        for new_row in &returned {
+            if let Some(old_row) = old_by_pk.get(&new_row.pkey()) {
+                let new_json = serde_json::to_value(new_row).unwrap_or_else(|_| json!({}));
+                let old_json = serde_json::to_value(old_row).unwrap_or_else(|_| json!({}));
+
+                let diff_row = tx_arc
+                    .as_ref()
+                    .query_one(Statement::from_sql_and_values(
+                        sea_orm::DbBackend::Postgres,
+                        "SELECT jsonb_deep_diff_only_new($1::jsonb, $2::jsonb) AS diff",
+                        vec![new_json.into(), old_json.into()],
+                    ))
+                    .await
+                    .map_err(|e| sea_orm::DbErr::Custom(format!("diff query failed: {e}")))?;
+
+                let diff: serde_json::Value = diff_row
+                    .and_then(|r| r.try_get("", "diff").ok())
+                    .unwrap_or_else(|| json!({}));
+
+                let pk_json = pk_json_from_model(new_row);
+                let meta = meta_from_model(new_row);
+                let mono =
+                    serde_json::to_value(new_row.mono_field()).unwrap_or_else(|_| json!(null));
+
+                Outbox::insert(
+                    tx_arc.as_ref(),
+                    &table_name_for_outbox,
+                    pk_json,
+                    CrudOpType::U,
+                    meta,
+                    diff,
+                    mono,
+                    chrono::Utc::now(),
+                )
+                .await
+                .map_err(|e| {
+                    sea_orm::DbErr::Custom(format!("outbox insert (update) failed: {e}"))
+                })?;
+            } else {
+                let pk_json = pk_json_from_model(new_row);
+                let meta = meta_from_model(new_row);
+                let mono =
+                    serde_json::to_value(new_row.mono_field()).unwrap_or_else(|_| json!(null));
+
+                Outbox::insert(
+                    tx_arc.as_ref(),
+                    &table_name_for_outbox,
+                    pk_json,
+                    CrudOpType::U,
+                    meta,
+                    json!({}),
+                    mono,
+                    chrono::Utc::now(),
+                )
+                .await
+                .map_err(|e| {
+                    sea_orm::DbErr::Custom(format!("outbox insert (update, no-old) failed: {e}"))
+                })?;
+            }
+        }
+
+        drop(tx_arc);
+
+        {
+            let mut inner = handle.conn.write().await;
+            inner.maybe_commit().await?;
+        }
 
         Ok(returned)
     }
@@ -383,20 +536,20 @@ where
             q = q.order_by_asc(col);
         }
 
-        let mut handle = handle.conn.write().await;
-
         if self
             .lock_for_update
             .load(std::sync::atomic::Ordering::Relaxed)
         {
+            let mut handle = handle.conn.write().await;
             handle.maybe_begin_transaction().await?;
 
             if handle.is_transaction() {
                 q = q.lock_exclusive()
             }
+            drop(handle)
         }
 
-        let returned_items = match &*handle {
+        let returned_items = match &*handle.conn.read().await {
             PostgresCrudableConnectionInner::Connection(c) => q.all(c).await,
             PostgresCrudableConnectionInner::OwnedTransaction(_, tx) => q.all(tx.as_ref()).await,
             PostgresCrudableConnectionInner::BorrowedTransaction(tx) => q.all(tx.as_ref()).await,
@@ -404,6 +557,14 @@ where
         .into_iter()
         .map(Arc::new)
         .collect();
+
+        if self
+            .lock_for_update
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            let mut inner = handle.conn.write().await;
+            inner.maybe_commit().await?;
+        }
 
         Ok(returned_items)
     }
@@ -414,6 +575,12 @@ where
         keys: &[<<CRUDTable as EntityTrait>::Model as Crudable>::Pkey],
         handle: Self::SourceHandle,
     ) -> Result<Vec<<CRUDTable as EntityTrait>::Model>, Self::Error> {
+        {
+            let mut inner = handle.conn.write().await;
+            inner.maybe_begin_transaction().await?;
+        }
+        let table = CRUDTable::default();
+        let table_name_for_outbox = table.table_name().to_string();
         let q = CRUDTable::delete_many()
             .filter(<CRUDTable as PostgresCrudableTable>::get_pkey_filter(keys));
 
@@ -426,6 +593,47 @@ where
                 q.exec_with_returning(tx.as_ref()).await
             }
         }?;
+
+        if returned_items.is_empty() {
+            let mut inner = handle.conn.write().await;
+            inner.maybe_commit().await?;
+            return Ok(returned_items);
+        }
+
+        let tx_arc = {
+            let inner = handle.conn.read().await;
+            inner
+                .tx_arc()
+                .expect("delete(): expected to be in a transaction")
+        };
+
+        for old_row in &returned_items {
+            let pk_json = pk_json_from_model(old_row);
+            let meta = meta_from_model(old_row);
+            let mono = serde_json::to_value(old_row.mono_field()).unwrap_or_else(|_| json!(null));
+
+            let diff = serde_json::to_value(old_row).unwrap_or_else(|_| json!({}));
+
+            Outbox::insert(
+                tx_arc.as_ref(),
+                &table_name_for_outbox,
+                pk_json,
+                CrudOpType::D,
+                meta,
+                diff,
+                mono,
+                chrono::Utc::now(),
+            )
+            .await
+            .map_err(|e| sea_orm::DbErr::Custom(format!("outbox insert (delete) failed: {e}")))?;
+        }
+
+        drop(tx_arc);
+
+        {
+            let mut inner = handle.conn.write().await;
+            inner.maybe_commit().await?;
+        }
 
         Ok(returned_items)
     }
@@ -448,7 +656,8 @@ where
     CRUDTable::Model: Crudable
         + ModelTrait<Entity = CRUDTable>
         + IntoActiveModel<<CRUDTable as EntityTrait>::ActiveModel>
-        + FromQueryResult,
+        + FromQueryResult
+        + serde::Serialize,
     <CRUDTable::Model as Crudable>::Pkey: TryGetableMany,
     CRUDTable::Column: Iterable + PartialEq,
     CRUDTable::ActiveModel: Send,
